@@ -1,7 +1,9 @@
 import ctypes
 import http.server
 import json
+import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+import uuid
 from ctypes import POINTER, Structure, c_char, c_char_p, c_int, c_ubyte, c_uint16, c_uint32, c_void_p
 from pathlib import Path
 
@@ -238,15 +241,98 @@ class MSDisplay:
 ROOT = RESOURCE_ROOT
 STOP_EVENT = threading.Event()
 STATE_LOCK = threading.Lock()
-STATE = {"status": "æ§ä»¶æœåŠ¡å·²å¯åŠ¨ï¼Œé€‰æ‹©è§†é¢‘åå³å¯å†™å…¥ã€‚", "active": False}
-CURRENT = {"thread": None, "process": None}
+APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ValkyrieV360"
+LIBRARY_ROOT = APP_DATA / "library"
+LIBRARY_INDEX = APP_DATA / "library.json"
+LIBRARY_LOCK = threading.RLock()
+LIBRARY_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv", ".mpeg", ".mpg", ".ts", ".3gp"}
+MAX_VIDEO_BYTES = 1024 * 1024 * 1024
+STATE = {
+    "status": "æ§ä»¶æœåŠ¡å·²å¯åŠ¨ï¼Œé€‰æ‹©è§†é¢‘åå³å¯å†™å…¥ã€‚", "active": False,
+    "device_connected": False, "current_video": "", "frames_sent": 0,
+    "elapsed_seconds": 0, "last_error": "", "started_at": time.time(),
+}
+CURRENT = {"thread": None, "process": None, "library_id": None}
 
 
-def set_status(status, active=None):
+def set_status(status, active=None, **updates):
     with STATE_LOCK:
         STATE["status"] = status
         if active is not None:
             STATE["active"] = active
+        if "å‘é€å¤±è´¥ï¼š" in status:
+            STATE["last_error"] = status.removeprefix("å‘é€å¤±è´¥ï¼š")
+        STATE.update(updates)
+
+
+def _library_read_unlocked():
+    LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        raw = json.loads(LIBRARY_INDEX.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    items = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        video_id = str(item.get("id", ""))
+        name = str(item.get("name", ""))
+        suffix = Path(name).suffix.lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", video_id) or suffix not in LIBRARY_EXTENSIONS:
+            continue
+        path = LIBRARY_ROOT / f"{video_id}{suffix}"
+        if not path.is_file():
+            continue
+        items.append({
+            "id": video_id, "name": name[:180], "size": path.stat().st_size,
+            "added": str(item.get("added", "")),
+        })
+    return sorted(items, key=lambda item: item["added"], reverse=True)
+
+
+def get_library_items():
+    with LIBRARY_LOCK:
+        return _library_read_unlocked()
+
+
+def save_library_items(items):
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    temp_index = APP_DATA / f"library-{uuid.uuid4().hex}.tmp"
+    temp_index.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_index, LIBRARY_INDEX)
+
+
+def get_library_item(video_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", video_id or ""):
+        return None, None
+    with LIBRARY_LOCK:
+        for item in _library_read_unlocked():
+            if item["id"] == video_id:
+                return item, LIBRARY_ROOT / f"{video_id}{Path(item['name']).suffix.lower()}"
+    return None, None
+
+
+def begin_playback(video_path, settings, display_name, library_id=None, delete_after=False):
+    with STATE_LOCK:
+        thread = CURRENT["thread"]
+        if thread and thread.is_alive():
+            return False
+        STOP_EVENT.clear()
+        worker = threading.Thread(
+            target=play_video,
+            args=(str(video_path), settings, display_name, library_id, delete_after),
+            daemon=True,
+        )
+        CURRENT.update(thread=worker, library_id=library_id)
+        STATE.update(
+            status="è§†é¢‘å·²æ¥æ”¶ï¼Œæ­£åœ¨è¿æ¥æ°´å†·å±â€¦", active=True,
+            device_connected=False, current_video=display_name,
+            frames_sent=0, elapsed_seconds=0, last_error="",
+        )
+        worker.start()
+        return True
 
 
 def read_exact(stream, length):
@@ -277,15 +363,17 @@ def make_filter(rotation, fit, brightness):
     return ",".join(filters)
 
 
-def play_video(video_path, settings):
+def play_video(video_path, settings, display_name, library_id=None, delete_after=False):
     device = process = None
+    frame_no = 0
     try:
         bundled_ffmpeg = RESOURCE_ROOT / "runtime" / "ffmpeg.exe"
         ffmpeg = str(bundled_ffmpeg) if bundled_ffmpeg.is_file() else shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("æœªæ‰¾åˆ° FFmpegã€‚è¯·å°† ffmpeg.exe åŠ å…¥ PATH åé‡å¯æ§ä»¶ã€‚")
-        set_status("æ­£åœ¨è¿æ¥ 345F:9132 å±å¹•â€¦", True)
+        set_status("æ­£åœ¨è¿æ¥ 345F:9132 å±å¹•â€¦", True, current_video=display_name)
         device = MSDisplay()
+        set_status("å±å¹• USB ä¼šè¯å·²è¿æ¥ï¼Œæ­£åœ¨åˆå§‹åŒ– 320Ã—240 æ¨¡å¼â€¦", device_connected=True)
         set_status("å±å¹•å·²è¿æ¥ï¼Œæ­£åœ¨åˆå§‹åŒ– 320Ã—240 æ¨¡å¼â€¦")
         device.initialize()
         command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-stream_loop", "-1", "-i", str(video_path),
@@ -300,7 +388,6 @@ def play_video(video_path, settings):
         with STATE_LOCK:
             CURRENT["process"] = process
         set_status("æ­£åœ¨å‘å±å¹•å†™å…¥è§†é¢‘å¸§â€¦")
-        frame_no = 0
         frame_period = 1 / 15
         next_frame_time = time.monotonic()
         while not STOP_EVENT.is_set():
@@ -322,13 +409,17 @@ def play_video(video_path, settings):
             else:
                 next_frame_time = time.monotonic()
             if frame_no % 15 == 0:
-                set_status(f"æ­£åœ¨æ’­æ”¾å¹¶å†™å…¥è§†é¢‘å¸§â€¦ {frame_no // 15} ç§’")
+                set_status(f"æ­£åœ¨æ’­æ”¾å¹¶å†™å…¥è§†é¢‘å¸§â€¦ {frame_no // 15} ç§’",
+                           frames_sent=frame_no, elapsed_seconds=frame_no // 15)
         if STOP_EVENT.is_set():
-            set_status("å‘é€å·²åœæ­¢ï¼Œå±å¹•ä¿ç•™æœ€åä¸€å¸§ã€‚", False)
+            set_status("å‘é€å·²åœæ­¢ï¼Œå±å¹•ä¿ç•™æœ€åä¸€å¸§ã€‚", False,
+                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // 15)
         else:
-            set_status("è§†é¢‘æ’­æ”¾ç»“æŸï¼Œå±å¹•ä¿ç•™æœ€åä¸€å¸§ã€‚", False)
+            set_status("è§†é¢‘æ’­æ”¾ç»“æŸï¼Œå±å¹•ä¿ç•™æœ€åä¸€å¸§ã€‚", False,
+                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // 15)
     except Exception as exc:
-        set_status(f"å‘é€å¤±è´¥ï¼š{exc}", False)
+        set_status(f"å‘é€å¤±è´¥ï¼š{exc}", False, device_connected=False,
+                   frames_sent=frame_no, elapsed_seconds=frame_no // 15)
         print(f"[video-error] {exc}")
     finally:
         if process:
@@ -339,14 +430,17 @@ def play_video(video_path, settings):
                 process.kill()
         if device:
             device.close()
-        try:
-            Path(video_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        if delete_after:
+            try:
+                Path(video_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         with STATE_LOCK:
             CURRENT["process"] = None
             CURRENT["thread"] = None
+            CURRENT["library_id"] = None
             STATE["active"] = False
+            STATE["device_connected"] = False
         STOP_EVENT.clear()
 
 
@@ -365,12 +459,93 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def local_origin_only(self):
+        origin = self.headers.get("Origin")
+        return not origin or origin.rstrip("/") == "http://127.0.0.1:8765"
+
+    def send_library_video(self, video_id):
+        item, video_path = get_library_item(video_id)
+        if not item or not video_path:
+            return self.send_json(404, {"ok": False, "error": "è§†é¢‘åº“ä¸­æ‰¾ä¸åˆ°è¯¥è§†é¢‘ã€‚"})
+        size = video_path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match or not (match.group(1) or match.group(2)):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            if match.group(1):
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            else:
+                suffix_length = int(match.group(2))
+                start = max(0, size - suffix_length)
+            if start >= size or end < start:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            end = min(end, size - 1)
+            status = 206
+        length = end - start + 1
+        content_type = mimetypes.guess_type(item["name"])[0] or "application/octet-stream"
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", "inline; filename*=UTF-8''" + urllib.parse.quote(item["name"]))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        try:
+            with video_path.open("rb") as source:
+                source.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def read_video_upload(self, length, target):
+        with target.open("wb") as output:
+            remaining = length
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ConnectionError("è§†é¢‘ä¸Šä¼ ä¸­æ–­ã€‚")
+                output.write(chunk)
+                remaining -= len(chunk)
+
+    def parsed_settings(self):
+        rotation = int(self.headers.get("X-Rotation", "0"))
+        fit = self.headers.get("X-Fit", "cover")
+        brightness = int(self.headers.get("X-Brightness", "100"))
+        if rotation not in (0, 90, 180, 270) or fit not in ("cover", "contain"):
+            raise ValueError("ç”»é¢è®¾ç½®æ— æ•ˆã€‚")
+        return rotation, fit, max(30, min(150, brightness))
+
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
         if path == "/api/status":
             with STATE_LOCK:
                 body = dict(STATE)
+            body["uptime_seconds"] = int(time.time() - body.pop("started_at", time.time()))
             return self.send_json(200, body)
+        if path == "/api/library":
+            items = get_library_items()
+            return self.send_json(200, {"items": items, "count": len(items),
+                                        "total_bytes": sum(item["size"] for item in items)})
+        if path.startswith("/api/library/file/"):
+            video_id = path.rsplit("/", 1)[-1]
+            return self.send_library_video(video_id)
         if path == "/api/stop":
             STOP_EVENT.set()
             return self.send_json(200, {"ok": True, "status": "æ­£åœ¨åœæ­¢å‘é€â€¦"})
@@ -378,6 +553,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
+        if not self.local_origin_only():
+            return self.send_json(403, {"ok": False, "error": "åªå…è®¸æœ¬æœºæ§ä»¶é¡µé¢è®¿é—®ã€‚"})
+        if path == "/api/library":
+            return self.save_uploaded_video()
+        if path == "/api/write-library":
+            return self.write_library_video()
         if path != "/api/write":
             return self.send_json(404, {"ok": False, "error": "æœªçŸ¥æ¥å£"})
         with STATE_LOCK:
@@ -386,17 +567,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self.send_json(409, {"ok": False, "error": "å½“å‰å·²æœ‰è§†é¢‘æ­£åœ¨å†™å…¥ï¼Œè¯·å…ˆåœæ­¢ã€‚"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 1024 * 1024 * 1024:
+            if length <= 0 or length > MAX_VIDEO_BYTES:
                 return self.send_json(413, {"ok": False, "error": "è§†é¢‘æ–‡ä»¶ä¸ºç©ºæˆ–è¶…è¿‡ 1 GBã€‚"})
-            rotation = int(self.headers.get("X-Rotation", "0"))
-            fit = self.headers.get("X-Fit", "cover")
-            brightness = int(self.headers.get("X-Brightness", "100"))
-            if rotation not in (0, 90, 180, 270) or fit not in ("cover", "contain"):
-                return self.send_json(400, {"ok": False, "error": "ç”»é¢è®¾ç½®æ— æ•ˆã€‚"})
-            brightness = max(30, min(150, brightness))
+            settings = self.parsed_settings()
             raw_name = urllib.parse.unquote(self.headers.get("X-Filename", "video.mp4"))
-            suffix = Path(raw_name).suffix
-            if len(suffix) > 8 or not suffix.startswith(".") or not suffix[1:].isalnum():
+            display_name = Path(raw_name.replace("\\", "/")).name
+            suffix = Path(display_name).suffix.lower()
+            if suffix not in LIBRARY_EXTENSIONS:
                 suffix = ".mp4"
             fd, tmp_name = tempfile.mkstemp(prefix="mythcool-", suffix=suffix)
             with os.fdopen(fd, "wb") as output:
@@ -407,13 +584,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         raise ConnectionError("è§†é¢‘ä¸Šä¼ ä¸­æ–­ã€‚")
                     output.write(chunk)
                     remaining -= len(chunk)
-            STOP_EVENT.clear()
-            settings = (rotation, fit, brightness)
-            thread = threading.Thread(target=play_video, args=(tmp_name, settings), daemon=True)
-            with STATE_LOCK:
-                CURRENT["thread"] = thread
-                STATE.update(status="è§†é¢‘å·²æ¥æ”¶ï¼Œæ­£åœ¨è¿æ¥æ°´å†·å±â€¦", active=True)
-            thread.start()
+            display_name = "".join(ch for ch in display_name if ord(ch) >= 32 and ch != "\x7f")[:180] or "video.mp4"
+            if not begin_playback(tmp_name, settings, display_name, delete_after=True):
+                Path(tmp_name).unlink(missing_ok=True)
+                return self.send_json(409, {"ok": False, "error": "å½“å‰å·²æœ‰è§†é¢‘æ­£åœ¨å†™å…¥ï¼Œè¯·å…ˆåœæ­¢ã€‚"})
             return self.send_json(202, {"ok": True, "status": "è§†é¢‘å·²æ¥æ”¶ï¼Œæ­£åœ¨è¿æ¥æ°´å†·å±â€¦"})
         except Exception as exc:
             try:
@@ -423,221 +597,86 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 pass
             return self.send_json(400, {"ok": False, "error": str(exc)})
 
-
-class TrayIcon:
-    """Small native Windows notification-area icon for the hidden server."""
-    WM_TRAY = 0x8000 + 21
-    WM_COMMAND = 0x0111
-    WM_DESTROY = 0x0002
-    WM_LBUTTONDBLCLK = 0x0203
-    WM_RBUTTONUP = 0x0205
-    NIM_ADD, NIM_DELETE, NIM_SETVERSION = 0, 2, 4
-    NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
-    MF_STRING, MF_SEPARATOR = 0, 0x0800
-    TPM_RIGHTBUTTON, TPM_RETURNCMD = 2, 0x0100
-    ID_OPEN, ID_EXIT = 1001, 1002
-
-    class Point(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-    class NotifyData(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", ctypes.c_uint), ("hWnd", ctypes.c_void_p), ("uID", ctypes.c_uint),
-            ("uFlags", ctypes.c_uint), ("uCallbackMessage", ctypes.c_uint),
-            ("hIcon", ctypes.c_void_p), ("szTip", ctypes.c_wchar * 128),
-            ("dwState", ctypes.c_uint), ("dwStateMask", ctypes.c_uint),
-            ("szInfo", ctypes.c_wchar * 256), ("uTimeout", ctypes.c_uint),
-            ("szInfoTitle", ctypes.c_wchar * 64), ("dwInfoFlags", ctypes.c_uint),
-            ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", ctypes.c_void_p),
-        ]
-
-    class WindowClass(ctypes.Structure):
-        pass
-
-    def __init__(self, server):
-        from ctypes import wintypes as wt
-        self.server = server
-        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
-        self.shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self.kernel32.GetModuleHandleW.restype = ctypes.c_void_p
-        self.kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-        self.hinstance = self.kernel32.GetModuleHandleW(None)
-        self.class_name = "ValkyrieV360WaterCoolTray"
-        self.WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
-                                          ctypes.c_size_t, ctypes.c_ssize_t)
-        self.WindowClass._fields_ = [
-            ("style", ctypes.c_uint), ("lpfnWndProc", self.WNDPROC),
-            ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-            ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
-            ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
-            ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p),
-        ]
-        self.user32.RegisterClassW.argtypes = [ctypes.POINTER(self.WindowClass)]
-        self.user32.RegisterClassW.restype = ctypes.c_ushort
-        self.user32.CreateWindowExW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p,
-            ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-        self.user32.CreateWindowExW.restype = ctypes.c_void_p
-        self.user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-        self.user32.LoadIconW.restype = ctypes.c_void_p
-        self._wndproc = self.WNDPROC(self._dispatch)
-        wc = self.WindowClass()
-        wc.lpfnWndProc = self._wndproc
-        wc.hInstance = self.hinstance
-        wc.lpszClassName = self.class_name
-        if not self.user32.RegisterClassW(ctypes.byref(wc)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        self.hwnd = self.user32.CreateWindowExW(0, self.class_name, "Valkyrie V360 æ°´å†·å±æ§ä»¶",
-                                                0, 0, 0, 0, 0, None, None, self.hinstance, None)
-        if not self.hwnd:
-            raise ctypes.WinError(ctypes.get_last_error())
-        self.data = self.NotifyData()
-        self.data.cbSize = ctypes.sizeof(self.NotifyData)
-        self.data.hWnd = self.hwnd
-        self.data.uID = 1
-        self.data.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
-        self.data.uCallbackMessage = self.WM_TRAY
-        self.data.hIcon = self.user32.LoadIconW(None, ctypes.cast(ctypes.c_void_p(32512), ctypes.c_wchar_p))
-        self.data.szTip = "Valkyrie V360 æ°´å†·å±æ§ä»¶ï¼ˆåå°è¿è¡Œï¼‰"
-        self.shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.POINTER(self.NotifyData)]
-        self.shell32.Shell_NotifyIconW.restype = ctypes.c_int
-        if not self.shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(self.data)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        self.user32.CreatePopupMenu.restype = ctypes.c_void_p
-        self.user32.AppendMenuW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
-        self.user32.GetCursorPos.argtypes = [ctypes.POINTER(self.Point)]
-        self.user32.TrackPopupMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
-                                               ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
-        self.user32.TrackPopupMenu.restype = ctypes.c_uint
-        self.user32.DestroyMenu.argtypes = [ctypes.c_void_p]
-        self.user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-        self.user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
-        self.user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
-        self.user32.DefWindowProcW.restype = ctypes.c_ssize_t
-        self.user32.PostQuitMessage.argtypes = [ctypes.c_int]
-
-    def _open_page(self):
-        page = "http://127.0.0.1:8765/" + urllib.parse.quote("æ°´å†·æ§ä»¶ç®€ç‰ˆ.html")
-        webbrowser.open(page)
-
-    def _show_menu(self):
-        menu = self.user32.CreatePopupMenu()
-        self.user32.AppendMenuW(menu, self.MF_STRING, self.ID_OPEN, "æ‰“å¼€æ°´å†·å±æ§ä»¶")
-        self.user32.AppendMenuW(menu, self.MF_SEPARATOR, 0, None)
-        self.user32.AppendMenuW(menu, self.MF_STRING, self.ID_EXIT, "é€€å‡ºåå°æœåŠ¡")
-        point = self.Point()
-        self.user32.GetCursorPos(ctypes.byref(point))
-        self.user32.SetForegroundWindow(self.hwnd)
-        command = self.user32.TrackPopupMenu(menu, self.TPM_RIGHTBUTTON | self.TPM_RETURNCMD,
-                                             point.x, point.y, 0, self.hwnd, None)
-        self.user32.DestroyMenu(menu)
-        self.user32.PostMessageW(self.hwnd, 0, 0, 0)
-        if command == self.ID_OPEN:
-            self._open_page()
-        elif command == self.ID_EXIT:
-            self.user32.PostQuitMessage(0)
-
-    def _dispatch(self, hwnd, message, wparam, lparam):
-        if message == self.WM_TRAY:
-            event = lparam & 0xFFFF
-            if event == self.WM_LBUTTONDBLCLK:
-                self._open_page()
-            elif event == self.WM_RBUTTONUP:
-                self._show_menu()
-            return 0
-        if message == self.WM_COMMAND and (wparam & 0xFFFF) == self.ID_EXIT:
-            self.user32.PostQuitMessage(0)
-            return 0
-        if message == self.WM_DESTROY:
-            self.shell32.Shell_NotifyIconW(self.NIM_DELETE, ctypes.byref(self.data))
-            self.user32.PostQuitMessage(0)
-            return 0
-        pointer_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
-        return self.user32.DefWindowProcW(hwnd, message, wparam, ctypes.c_void_p(lparam & pointer_mask))
-
-    def run(self):
-        from ctypes import wintypes as wt
-        self.user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
-        self.user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
-        self.user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
-        message = wt.MSG()
-        while self.user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
-            self.user32.TranslateMessage(ctypes.byref(message))
-            self.user32.DispatchMessageW(ctypes.byref(message))
-        self.shell32.Shell_NotifyIconW(self.NIM_DELETE, ctypes.byref(self.data))
-
-
-def main():
-    if "--install-startup" in sys.argv:
-        import winreg
-        exe_path = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
-        command = f'"{exe_path}" --background'
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-            winreg.SetValueEx(key, "ValkyrieV360WaterCool", 0, winreg.REG_SZ, command)
-        print("å·²è®¾ç½®å½“å‰ç”¨æˆ·ç™»å½•è‡ªå¯ï¼š" + command)
-        return
-    if "--remove-startup" in sys.argv:
-        import winreg
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-            try:
-                winreg.DeleteValue(key, "ValkyrieV360WaterCool")
-            except FileNotFoundError:
-                pass
-        print("å·²ç§»é™¤å½“å‰ç”¨æˆ·ç™»å½•è‡ªå¯é¡¹ã€‚")
-        return
-    if "--background" in sys.argv:
-        log_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ValkyrieV360"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_dir / "control.log", "a", encoding="utf-8", buffering=1)
-        sys.stdout = log_file
-        sys.stderr = log_file
-    page = "http://127.0.0.1:8765/" + urllib.parse.quote("æ°´å†·æ§ä»¶ç®€ç‰ˆ.html")
-    background = "--background" in sys.argv
-    if not background:
+    def save_uploaded_video(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > MAX_VIDEO_BYTES:
+            return self.send_json(413, {"ok": False, "error": "è§†é¢‘æ–‡ä»¶ä¸ºç©ºæˆ–è¶…è¿‡ 1 GBã€‚"})
+        raw_name = urllib.parse.unquote(self.headers.get("X-Filename", "video.mp4"))
+        name = Path(raw_name.replace("\\", "/")).name
+        name = "".join(ch for ch in name if ord(ch) >= 32 and ch != "\x7f")[:180]
+        suffix = Path(name).suffix.lower()
+        if not name or suffix not in LIBRARY_EXTENSIONS:
+            return self.send_json(415, {"ok": False, "error": "ä¸æ”¯æŒæ­¤è§†é¢‘æ ¼å¼ã€‚è¯·é€‰æ‹©å¸¸è§è§†é¢‘æ–‡ä»¶ã€‚"})
+        video_id = uuid.uuid4().hex
+        video_path = LIBRARY_ROOT / f"{video_id}{suffix}"
+        temp_path = LIBRARY_ROOT / f"{video_id}.part"
         try:
-            urllib.request.urlopen("http://127.0.0.1:8765/api/status", timeout=0.7).close()
-        except Exception:
-            pass
-        else:
-            webbrowser.open(page)
-            return
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    server.daemon_threads = True
-    print("V360 MERLIN æ°´å†·å±æ§ä»¶å·²å¯åŠ¨ï¼š" + page)
-    print("ä»…ç›‘å¬æœ¬æœºå›ç¯åœ°å€ï¼›å³é”®ä»»åŠ¡æ é€šçŸ¥åŒºå›¾æ ‡å¯æ‰“å¼€æ§ä»¶æˆ–é€€å‡ºåå°æœåŠ¡ã€‚")
-    serve_thread = None
-    try:
-        tray = TrayIcon(server)
-    except Exception as exc:
-        print(f"[tray-error] æ— æ³•åˆ›å»ºä»»åŠ¡æ å›¾æ ‡ï¼š{exc}")
-        if not background:
-            threading.Timer(0.8, lambda: webbrowser.open(page)).start()
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-    else:
-        serve_thread = threading.Thread(target=server.serve_forever, name="watercool-http", daemon=True)
-        serve_thread.start()
-        if not background:
-            threading.Timer(0.8, lambda: webbrowser.open(page)).start()
-        tray.run()
-    finally:
-        STOP_EVENT.set()
-        with STATE_LOCK:
-            process = CURRENT["process"]
-            worker = CURRENT["thread"]
-        if process and process.poll() is None:
-            process.terminate()
-        if worker and worker.is_alive():
-            worker.join(timeout=3)
-        if getattr(locals().get("tray", None), "hwnd", None):
-            tray.user32.DestroyWindow(tray.hwnd)
-        if serve_thread and serve_thread.is_alive():
-            server.shutdown()
-        server.server_close()
+            with LIBRARY_LOCK:
+                LIBRARY_ROOT.mkdir(parents=True, exist_ok=True)
+                self.read_video_upload(length, temp_path)
+                os.replace(temp_path, video_path)
+                item = {"id": video_id, "name": name, "size": length,
+                        "added": time.strftime("%Y-%m-%d %H:%M:%S")}
+                items = [item] + _library_read_unlocked()
+                save_library_items(items)
+            return self.send_json(201, {"ok": True, "item": item})
+        except Exception as exc:
+            temp_path.unlink(missing_ok=True)
+            video_path.unlink(missing_ok=True)
+        6ó¾­¢G§²ÚîÆ­yØÛÛ[X[™OHÙ[‹’QÑVU‚ˆÙ[‹\Ù\ŒÌ‹”Üİ]Z]Y\ÜØYÙJ
+B‚ˆYˆÙ\Ü]Ú
+Ù[‹Û™Y\ÜØYÙKÜ\˜[K\˜[JN‚ˆYˆY\ÜØYÙHOHÙ[‹•ÓWÕVN‚ˆ]™[H\˜[H	ˆ‘‘‘‚ˆYˆ]™[OHÙ[‹•ÓWÓ•UÓ‘“ÓÎ‚ˆÙ[‹—ÛÜ[—ÜYÙJ
+Bˆ[Yˆ]™[OHÙ[‹•ÓWÔ•UÓ•T‚ˆÙ[‹—ÜÚİ×ÛY[J
+Bˆ™]\›ˆˆYˆY\ÜØYÙHOHÙ[‹•ÓWĞÓÓSPS‘[™
+Ü\˜[H	ˆ‘‘‘ŠHOHÙ[‹’QÑVU‚ˆÙ[‹\Ù\ŒÌ‹”Üİ]Z]Y\ÜØYÙJ
+Bˆ™]\›ˆˆYˆY\ÜØYÙHOHÙ[‹•ÓWÑTÕ“ÖN‚ˆÙ[‹œÚ[Ì‹”Ú[Ó›İYRXÛÛ•ÊÙ[‹“’SWÑSUKİ\\Ë˜\™YŠÙ[‹™]JJBˆÙ[‹\Ù\ŒÌ‹”Üİ]Z]Y\ÜØYÙJ
+Bˆ™]\›ˆˆÚ[\—ÛX\ÚÈH
+H
+İ\\ËœÚ^™[ÙŠİ\\Ë˜×İ›ÚYÜ
+H
+ˆ
+JHHBˆ™]\›ˆÙ[‹\Ù\ŒÌ‹‘Y•Ú[™İÔ›ØÕÊÛ™Y\ÜØYÙKÜ\˜[Kİ\\Ë˜×İ›ÚYÜ
+\˜[H	ˆÚ[\—ÛX\ÚÊJB‚ˆYˆ[ŠÙ[ŠN‚ˆœ›ÛHİ\\È[\ÜÚ[\\È\ÈİˆÙ[‹\Ù\ŒÌ‹‘Ù]Y\ÜØYÙUË˜\™İ\\ÈHØİ\\Ë”ÒS•TŠİ“TÑÊKİ\\Ë˜×İ›ÚYÜİ\\Ë˜×İZ[İ\\Ë˜×İZ[BˆÙ[‹\Ù\ŒÌ‹•˜[œÛ]SY\ÜØYÙK˜\™İ\\ÈHØİ\\Ë”ÒS•TŠİ“TÑÊWBˆÙ[‹\Ù\ŒÌ‹‘\Ü]ÚY\ÜØYÙUË˜\™İ\\ÈHØİ\\Ë”ÒS•TŠİ“TÑÊWBˆY\ÜØYÙHHİ“TÑÊ
+BˆÚ[HÙ[‹\Ù\ŒÌ‹‘Ù]Y\ÜØYÙUÊİ\\Ë˜\™YŠY\ÜØYÙJK›Û™K
+Hˆ‚ˆÙ[‹\Ù\ŒÌ‹•˜[œÛ]SY\ÜØYÙJİ\\Ë˜\™YŠY\ÜØYÙJJBˆÙ[‹\Ù\ŒÌ‹‘\Ü]ÚY\ÜØYÙUÊİ\\Ë˜\™YŠY\ÜØYÙJJBˆÙ[‹œÚ[Ì‹”Ú[Ó›İYRXÛÛ•ÊÙ[‹“’SWÑSUKİ\\Ë˜\™YŠÙ[‹™]JJB‚‚™YˆXZ[Š
+N‚ˆYˆ‹KZ[œİ[\İ\\ˆ[ˆŞ\Ë˜\™İ‚ˆ[\ÜÚ[œ™YÂˆ^WÜ]H]
+Ş\Ë™^Xİ]X›HYˆÙ]]ŠŞ\Ë™œ›Ş™[ˆ‹˜[ÙJH[ÙH×Ùš[W×ÊKœ™\ÛÛ™J
+BˆÛÛ[X[™H‰ÈÙ^WÜ]HˆKX˜XÚÙÜ›İ[™	ÂˆÚ]Ú[œ™YËÜ™X]RÙ^JÚ[œ™YË’ÑVWĞÕT”‘S•ÕTÑT‹ˆ”ÛÙØ\™WZXÜ›ÜÛÙÚ[™İÜ×İ\œ™[™\œÚ[Û—[ˆŠH\ÈÙ^N‚ˆÚ[œ™YË”Ù]˜[YQ^
+Ù^K•˜[Ş\šYUŒÍŒØ]\ÛÛÛ‹Ú[œ™YË”‘Q×ÔÖ‹ÛÛ[X[™
+Bˆš[
+¹mìº+¯¹ïk¹odùbcyå*9¢-ùænùoez!ê¹d+ûï&ˆˆ
+ÈÛÛ[X[™
+Bˆ™]\›‚ˆYˆ‹K\™[[İ™K\İ\\ˆ[ˆŞ\Ë˜\™İ‚ˆ[\ÜÚ[œ™YÂˆÚ]Ú[œ™YËÜ™X]RÙ^JÚ[œ™YË’ÑVWĞÕT”‘S•ÕTÑT‹ˆ”ÛÙØ\™WZXÜ›ÜÛÙÚ[™İÜ×İ\œ™[™\œÚ[Û—[ˆŠH\ÈÙ^N‚ˆN‚ˆÚ[œ™YË‘[]U˜[YJÙ^K•˜[Ş\šYUŒÍŒØ]\ÛÛÛŠBˆ^Ù\š[S›İ›İ[™\œ›Ü‚ˆ\ÜÂˆš[
+¹mì¹éîúfi9odùbcyå*9¢-ùænùoez!ê¹d+úhnxà ˆŠBˆ™]\›‚ˆYˆ‹KX˜XÚÙÜ›İ[™ˆ[ˆŞ\Ë˜\™İ‚ˆÙ×Ù\ˆH]
+ÜË™[š\›Û‹™Ù]
+“ĞĞSTUH‹]šÛYJ
+JJHÈ•˜[Ş\šYUŒÍŒ‚ˆÙ×Ù\‹›ZÙ\Š\™[ÏUYK^\İÛÚÏUYJBˆÙ×Ùš[HHÜ[ŠÙ×Ù\ˆÈ˜ÛÛ›Û›ÙÈ‹˜H‹[˜ÛÙ[™ÏH]‹N‹Y™™\š[™ÏLJBˆŞ\Ëœİİ]HÙ×Ùš[BˆŞ\Ëœİ\œˆHÙ×Ùš[BˆYÙHHš‹ËÌLËŒŒŒNÍKÈˆ
+È\›X‹œ\œÙKœ][İJ¹¬-9a­ù£©ù.í¹ë 9âbš[ŠBˆ˜XÚÙÜ›İ[™H‹KX˜XÚÙÜ›İ[™ˆ[ˆŞ\Ë˜\™İ‚ˆYˆ›İ˜XÚÙÜ›İ[™‚ˆN‚ˆ\›X‹œ™\]Y\İ\›Ü[Šš‹ËÌLËŒŒŒNÍKØ\KÜİ]\È‹[Y[İ]LÊK˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Û‚ˆ\ÜÂˆ[ÙN‚ˆÙX˜œ›İÜÙ\‹›Ü[ŠYÙJBˆ™]\›‚ˆÙ\™\ˆHœÙ\™\‹•™XY[™ÒÙ\™\Š
+ŒLËŒŒŒH‹ÍJK[™\ŠBˆÙ\™\‹™Y[[Û—İ™XYÈHYBˆš[
+•ŒÍŒQT“Sˆ9¬-9a­ùlcù£©ù.í¹mì¹d+ùbª;ï&ˆˆ
+ÈYÙJBˆš[
+¹.áyæäyd+9§+9§.¹fç¹ã«ùg,9g`;ï&ùcìúe+¹.îùb¨y¨#ú`&¹çéyc.¹fï¹¨!ùcëù¢dùo 9£©ù.í¹¢%º` 9aî¹d#¹cì9§#yb¨xà ˆŠBˆÙ\™Wİ™XYH›Û™BˆN‚ˆ˜^HH˜^RXÛÛŠÙ\™\ŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆš[
+ˆ–İ˜^KY\œ›Ü—H9¥è9¬åyb&ùnî¹.îùb¨y¨#ùfï¹¨!ûï&Ù^ßHŠBˆYˆ›İ˜XÚÙÜ›İ[™‚ˆ™XY[™Ë•[Y\Š[X™NˆÙX˜œ›İÜÙ\‹›Ü[ŠYÙJJKœİ\
 
+BˆN‚ˆÙ\™\‹œÙ\™WÙ›Ü™]™\Š
+Bˆ^Ù\Ù^X›Ø\™[\œ\‚ˆ\ÜÂˆ[ÙN‚ˆÙ\™Wİ™XYH™XY[™Ë•™XY
+\™Ù]\Ù\™\‹œÙ\™WÙ›Ü™]™\‹˜[YOHØ]\˜ÛÛÛZ‹Y[[ÛUYJBˆÙ\™Wİ™XYœİ\
 
-if __name__ == "__main__":
-    main()
+BˆYˆ›İ˜XÚÙÜ›İ[™‚ˆ™XY[™Ë•[Y\Š[X™NˆÙX˜œ›İÜÙ\‹›Ü[ŠYÙJJKœİ\
+
+Bˆ˜^Kœ[Š
+Bˆš[˜[N‚ˆÕÔÑU‘S•œÙ]
+
+BˆÚ]ÕUWÓĞÒÎ‚ˆ›ØÙ\ÜÈHÕT”‘S•Èœ›ØÙ\ÜÈ—BˆÛÜšÙ\ˆHÕT”‘S•È™XY—BˆYˆ›ØÙ\ÜÈ[™›ØÙ\ÜËœÛ
+
+H\È›Û™N‚ˆ›ØÙ\ÜË\›Z[˜]J
+BˆYˆÛÜšÙ\ˆ[™ÛÜšÙ\‹š\×Ø[]™J
+N‚ˆÛÜšÙ\‹š›Ú[Š[Y[İ]LÊBˆYˆÙ]]ŠØØ[Ê
+K™Ù]
+˜^H‹›Û™JKšÛ™‹›Û™JN‚ˆ˜^K\Ù\ŒÌ‹‘\İ›ŞUÚ[™İÊ˜^KšÛ™
+BˆYˆÙ\™Wİ™XY[™Ù\™Wİ™XYš\×Ø[]™J
+N‚ˆÙ\™\‹œÚ]İÛŠ
+BˆÙ\™\‹œÙ\™\—ØÛÜÙJ
+B‚‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×È‚ˆXZ[Š
+B
