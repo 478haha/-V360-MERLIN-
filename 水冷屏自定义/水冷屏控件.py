@@ -258,7 +258,7 @@ PLAYBACK_FPS = 10  # The vendor frame trigger carries a 100 ms delay.
 STATE = {
     "status": "控件服务已启动，选择视频后即可写入。", "active": False,
     "device_connected": False, "current_video": "", "frames_sent": 0,
-    "elapsed_seconds": 0, "last_error": "", "started_at": time.time(),
+    "elapsed_seconds": 0, "fps": PLAYBACK_FPS, "last_error": "", "started_at": time.time(),
 }
 CURRENT = {"thread": None, "process": None, "library_id": None}
 
@@ -368,7 +368,7 @@ def begin_playback(video_path, settings, display_name, library_id=None, delete_a
         STATE.update(
             status="视频已接收，正在连接水冷屏…", active=True,
             device_connected=False, current_video=display_name,
-            frames_sent=0, elapsed_seconds=0, last_error="",
+            frames_sent=0, elapsed_seconds=0, fps=settings[3], last_error="",
         )
         worker.start()
         return True
@@ -384,7 +384,7 @@ def read_exact(stream, length):
     return bytes(chunks)
 
 
-def make_filter(rotation, fit, brightness):
+def make_filter(rotation, fit, brightness, fps=PLAYBACK_FPS):
     filters = []
     if rotation == 90:
         filters.append("transpose=clock")
@@ -398,7 +398,7 @@ def make_filter(rotation, fit, brightness):
         filters.append(f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:black")
     else:
         filters.append(f"crop={WIDTH}:{HEIGHT}")
-    filters.extend((f"eq=brightness={(brightness - 100) / 100:.3f}", f"fps={PLAYBACK_FPS}", "setsar=1"))
+    filters.extend((f"eq=brightness={(brightness - 100) / 100:.3f}", f"fps={fps}", "setsar=1"))
     return ",".join(filters)
 
 
@@ -427,7 +427,8 @@ def play_video(video_path, settings, display_name, library_id=None, delete_after
         with STATE_LOCK:
             CURRENT["process"] = process
         set_status("正在向屏幕写入视频帧…")
-        frame_period = 1 / PLAYBACK_FPS
+        fps = settings[3]
+        frame_period = 1 / fps
         next_frame_time = time.monotonic()
         while not STOP_EVENT.is_set():
             frame = read_exact(process.stdout, WIDTH * HEIGHT * 3)
@@ -447,18 +448,18 @@ def play_video(video_path, settings, display_name, library_id=None, delete_after
                 STOP_EVENT.wait(delay)
             else:
                 next_frame_time = time.monotonic()
-            if frame_no % 15 == 0:
-                set_status(f"正在播放并写入视频帧… {frame_no // 15} 秒",
-                           frames_sent=frame_no, elapsed_seconds=frame_no // PLAYBACK_FPS)
+            if frame_no % fps == 0:
+                set_status(f"正在播放并写入视频帧… {frame_no // fps} 秒",
+                           frames_sent=frame_no, elapsed_seconds=frame_no // fps)
         if STOP_EVENT.is_set():
             set_status("发送已停止，屏幕保留最后一帧。", False,
-                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // PLAYBACK_FPS)
+                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // fps)
         else:
             set_status("视频播放结束，屏幕保留最后一帧。", False,
-                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // PLAYBACK_FPS)
+                       device_connected=False, frames_sent=frame_no, elapsed_seconds=frame_no // settings[3])
     except Exception as exc:
         set_status(f"发送失败：{exc}", False, device_connected=False,
-                   frames_sent=frame_no, elapsed_seconds=frame_no // PLAYBACK_FPS)
+                   frames_sent=frame_no, elapsed_seconds=frame_no // settings[3])
         print(f"[video-error] {exc}")
     finally:
         if process:
@@ -567,9 +568,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         rotation = int(self.headers.get("X-Rotation", "0"))
         fit = self.headers.get("X-Fit", "cover")
         brightness = int(self.headers.get("X-Brightness", "100"))
+        fps = int(self.headers.get("X-Fps", str(PLAYBACK_FPS)))
         if rotation not in (0, 90, 180, 270) or fit not in ("cover", "contain"):
             raise ValueError("画面设置无效。")
-        return rotation, fit, max(30, min(150, brightness))
+        if fps < 1 or fps > 30:
+            raise ValueError("视频帧率必须在 1 到 30 FPS 之间。")
+        return rotation, fit, max(30, min(150, brightness)), fps
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
