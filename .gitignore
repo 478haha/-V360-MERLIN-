@@ -1,0 +1,25 @@
+# Local application output and generated files
+水冷屏自定义/dist/
+水冷屏自定义/build/
+水冷屏自定义/builddeps/
+水冷屏自定义/runtime/
+水冷屏自定义/__pycache__/
+水冷屏自定义/*.spec
+*.py[cod]
+__pycache__/
+
+# Original vendor installer, extracted vendor application/assets and binaries
+Setup_*.exe
+Myth.Cool_水冷视频控件/
+*.dll
+*.exe
+*.node
+*.cat
+*.inf
+
+# Local logs and editor files
+*.log
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

@@ -65,4 +65,3 @@ python -m pip install -r requirements.txt
 ## 第三方组件与许可
 
 本仓库不包含 Myth.Cool 安装程序、驱动、FFmpeg 二进制或其他第三方专有运行库。使用者需自行遵守各组件的许可和厂商条款。本项目未授予官方组件的再分发权。
-
